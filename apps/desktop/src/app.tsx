@@ -117,8 +117,11 @@ export function App(): JSX.Element {
     try {
       await tauriPing(url);
     } catch (e) {
-      setPhase({ kind: "failed", stage: "ping", error: e as AppError });
-      return;
+      const pingError = e as AppError;
+      if (!shouldProceedAfterPingFailure(pingError)) {
+        setPhase({ kind: "failed", stage: "ping", error: pingError });
+        return;
+      }
     }
 
     // Prefer an explicit password override (auto-reconnect path) over the
@@ -289,6 +292,20 @@ export function App(): JSX.Element {
       </div>
     </div>
   );
+}
+
+function shouldProceedAfterPingFailure(error: AppError): boolean {
+  const msg = (error.message || "").toLowerCase();
+  if (error.code === "REDIS_TLS" || error.code === "REDIS_TIMEOUT") {
+    return true;
+  }
+  if (
+    (error.code === "UNKNOWN" || error.code === "REDIS_REFUSED") &&
+    msg.includes("connection is closed")
+  ) {
+    return true;
+  }
+  return false;
 }
 
 function Splash(): JSX.Element {

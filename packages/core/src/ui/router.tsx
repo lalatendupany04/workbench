@@ -8,12 +8,16 @@ import {
   useParams,
   useSearch,
 } from "@tanstack/react-router";
+import { ArrowLeft } from "lucide-react";
 import * as React from "react";
 import { z } from "zod";
+import { useQueryClient } from "@tanstack/react-query";
 import { AppSidebar, type NavItem } from "@/components/app-sidebar";
 import { CommandPalette } from "@/components/layout/command-palette";
 import { HeaderSearch } from "@/components/layout/header-search";
+import { Button } from "@/components/ui/button";
 import { useConfig, useQueueNames, useQueues } from "@/lib/hooks";
+import { api } from "@/lib/api";
 import { FlowPage } from "@/pages/flow";
 import { FlowsPage } from "@/pages/flows";
 import { JobPage } from "@/pages/job";
@@ -314,11 +318,29 @@ function PageLayout({
   children: React.ReactNode;
 }) {
   const context = useSearchContext();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const [refreshing, setRefreshing] = React.useState(false);
 
   return (
     <>
       <header className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-border px-6">
         <div className="flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              if (window.history.length > 1) {
+                window.history.back();
+                return;
+              }
+              navigate({ to: "/" });
+            }}
+            className="h-8 px-2"
+          >
+            <ArrowLeft className="h-4 w-4 mr-1" />
+            Back
+          </Button>
           <h1 className="text-lg font-semibold">{title}</h1>
           {subtitle && (
             <span className="font-mono text-sm text-muted-foreground">
@@ -331,6 +353,22 @@ function PageLayout({
           onValueChange={context.setSearchQuery}
           onFocus={() => context.setCommandOpen(true)}
         />
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={refreshing}
+          onClick={async () => {
+            setRefreshing(true);
+            try {
+              await api.refresh();
+              await queryClient.invalidateQueries();
+            } finally {
+              setRefreshing(false);
+            }
+          }}
+        >
+          {refreshing ? "Refreshing..." : "Refresh"}
+        </Button>
       </header>
       <main className="flex-1 overflow-auto p-6">{children}</main>
     </>

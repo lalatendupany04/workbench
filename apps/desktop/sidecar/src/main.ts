@@ -61,6 +61,7 @@ function classify(e: unknown): ErrorCode {
   )
     return "REDIS_AUTH";
   if (msg.includes("econnrefused")) return "REDIS_REFUSED";
+  if (msg.includes("connection is closed")) return "REDIS_TLS";
   if (msg.includes("enotfound") || msg.includes("eai_again"))
     return "REDIS_DNS";
   if (msg.includes("tls") || msg.includes("ssl")) return "REDIS_TLS";
@@ -154,6 +155,9 @@ async function main(): Promise<void> {
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
+    // Flow discovery can legitimately take >10s on large deployments.
+    // Raise idle timeout so `/api/flows` responses aren't dropped mid-compute.
+    idleTimeout: 60,
     fetch: app.fetch,
   });
 

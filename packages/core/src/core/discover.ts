@@ -1,5 +1,5 @@
 import { Queue, type RedisOptions } from "bullmq";
-import { Redis } from "ioredis";
+import { Cluster, Redis } from "ioredis";
 
 /**
  * Discover BullMQ queues on a Redis connection by scanning for `<prefix>:*:meta`
@@ -14,17 +14,8 @@ export async function discoverQueues(
   prefix = "bull",
 ): Promise<Queue[]> {
   const normalized = normalizeConnection(connection);
-  const client = createScanClient(normalized);
-
-  // Surface the underlying connection error (ECONNREFUSED, NOAUTH, EAI_AGAIN,
-  // ENOTFOUND, TLS errors, etc.) rather than letting ioredis bury it under a
-  // "max retries per request" wrapper. We swap the first error in via the
-  // event listener and reject the ping promise with it.
-  const firstError = captureFirstError(client);
-
   try {
-    await Promise.race([client.ping(), firstError.promise]);
-    const names = await scanQueueNames(client, prefix);
+    const names = await discoverQueueNamesStandalone(normalized, prefix);
     return names.map(
       (name) =>
         new Queue(name, {
@@ -32,13 +23,44 @@ export async function discoverQueues(
           prefix,
         }),
     );
+  } catch (error) {
+    if (!shouldTryClusterFallback(error, normalized)) {
+      throw error;
+    }
+
+    const cluster = await connectClusterWithRetry(normalized);
+    try {
+      const names = await scanQueueNamesCluster(cluster, prefix);
+      return names.map(
+        (name) =>
+          new Queue(name, {
+            connection: cluster,
+            prefix,
+          }),
+      );
+    } catch (clusterError) {
+      cluster.disconnect();
+      throw clusterError;
+    }
+  }
+}
+
+async function discoverQueueNamesStandalone(
+  normalized: RedisOptions & { url?: string },
+  prefix: string,
+): Promise<string[]> {
+  const client = createScanClient(normalized);
+  const firstError = captureFirstError(client);
+  try {
+    await Promise.race([client.ping(), firstError.promise]);
+    return scanQueueNames(client, prefix);
   } finally {
     firstError.dispose();
     client.disconnect();
   }
 }
 
-function captureFirstError(client: Redis): {
+function captureFirstError(client: Redis | Cluster): {
   promise: Promise<never>;
   dispose: () => void;
 } {
@@ -87,6 +109,84 @@ function createScanClient(opts: RedisOptions & { url?: string }): Redis {
   return new Redis({ ...rest, lazyConnect: false, maxRetriesPerRequest: 1 });
 }
 
+function createClusterClient(opts: RedisOptions & { url?: string }): Cluster {
+  const { url, ...rest } = opts;
+  const startupNode = getStartupNode(url, rest);
+  const parsed = url ? new URL(url) : null;
+  const usernameFromUrl = parsed?.username
+    ? decodeURIComponent(parsed.username)
+    : "";
+  const passwordFromUrl = parsed?.password
+    ? decodeURIComponent(parsed.password)
+    : "";
+  const isTls = (parsed?.protocol ?? "").toLowerCase() === "rediss:";
+
+  return new Cluster([startupNode], {
+    // Keep hostnames for TLS cert validation on managed Redis cluster nodes.
+    dnsLookup: (address, callback) => callback(null, address),
+    redisOptions: {
+      ...rest,
+      username: rest.username ?? (usernameFromUrl || undefined),
+      password: rest.password ?? (passwordFromUrl || undefined),
+      tls: rest.tls ?? (isTls ? {} : undefined),
+      lazyConnect: true,
+      maxRetriesPerRequest: 1,
+    },
+  });
+}
+
+function getStartupNode(
+  url: string | undefined,
+  opts: RedisOptions,
+): { host: string; port: number } {
+  if (url) {
+    const parsed = new URL(url);
+    return {
+      host: parsed.hostname,
+      port: parsed.port ? Number(parsed.port) : 6379,
+    };
+  }
+  return {
+    host: opts.host ?? "127.0.0.1",
+    port: opts.port ?? 6379,
+  };
+}
+
+async function connectClusterWithRetry(
+  normalized: RedisOptions & { url?: string },
+): Promise<Cluster> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const cluster = createClusterClient(normalized);
+    cluster.on("error", () => {});
+    try {
+      try {
+        await withTimeout(
+          cluster.connect(),
+          5000,
+          "Redis cluster connect timed out",
+        );
+      } catch (connectError) {
+        if (!isAlreadyConnectingError(connectError)) {
+          throw connectError;
+        }
+      }
+      await withTimeout(cluster.ping(), 5000, "Redis cluster ping timed out");
+      return cluster;
+    } catch (error) {
+      lastError = error;
+      cluster.disconnect();
+      if (!isRetryableClusterError(error) || attempt >= 2) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Failed to connect to Redis cluster");
+}
+
 /**
  * Cursored SCAN for `<prefix>:*:meta` keys. BullMQ writes a meta key for each
  * queue on first use; using that as the discovery signal avoids matching
@@ -116,6 +216,67 @@ async function scanQueueNames(
   } while (cursor !== "0");
 
   return Array.from(names).sort();
+}
+
+async function scanQueueNamesCluster(
+  cluster: Cluster,
+  prefix: string,
+): Promise<string[]> {
+  const names = new Set<string>();
+  const nodes = cluster.nodes("master");
+  for (const node of nodes) {
+    const fromNode = await scanQueueNames(node, prefix);
+    for (const name of fromNode) names.add(name);
+  }
+  return Array.from(names).sort();
+}
+
+function shouldTryClusterFallback(
+  error: unknown,
+  normalized: RedisOptions & { url?: string },
+): boolean {
+  if (isMovedError(error) || isRetryableClusterError(error)) {
+    return true;
+  }
+  const host = normalized.url ? new URL(normalized.url).hostname : normalized.host;
+  return typeof host === "string" && host.toLowerCase().startsWith("clustercfg.");
+}
+
+function isMovedError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return /^\s*MOVED\s+\d+\s+\S+:\d+/i.test(error.message);
+}
+
+function isRetryableClusterError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const msg = error.message.trim().toLowerCase();
+  return (
+    msg.includes("connection is closed") ||
+    msg.includes("failed to refresh slots cache") ||
+    msg.includes("cluster all failed") ||
+    msg.includes("timed out")
+  );
+}
+
+function isAlreadyConnectingError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return /already connecting\/connected/i.test(error.message);
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function parseQueueName(key: string, prefix: string): string | null {

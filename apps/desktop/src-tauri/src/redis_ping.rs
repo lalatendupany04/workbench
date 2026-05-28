@@ -7,6 +7,24 @@ use crate::AppError;
 /// Returns the same `AppError.code` taxonomy as the sidecar so the UI has
 /// one switch statement.
 pub async fn ping(url: &str) -> Result<(), AppError> {
+    // Some managed Redis endpoints (notably AWS ElastiCache config endpoints)
+    // require TLS even when users type redis://. Mirror sidecar behavior:
+    // if the first ping looks like a TLS/closed-socket failure, retry once
+    // with rediss:// transparently.
+    match ping_once(url).await {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            if should_retry_with_tls(url, &first) {
+                let tls_url = force_tls_url(url);
+                ping_once(&tls_url).await
+            } else {
+                Err(first)
+            }
+        }
+    }
+}
+
+async fn ping_once(url: &str) -> Result<(), AppError> {
     let client = redis::Client::open(url).map_err(|e| AppError::new("REDIS_URL_INVALID", e.to_string()))?;
 
     let connect_fut = client.get_multiplexed_async_connection();
@@ -25,10 +43,23 @@ pub async fn ping(url: &str) -> Result<(), AppError> {
     }
 }
 
+fn should_retry_with_tls(url: &str, err: &AppError) -> bool {
+    url.starts_with("redis://")
+        && (err.code == "REDIS_TLS" || err.message.to_lowercase().contains("connection is closed"))
+}
+
+fn force_tls_url(url: &str) -> String {
+    url.replacen("redis://", "rediss://", 1)
+}
+
 fn classify(err: redis::RedisError) -> AppError {
     let kind = err.kind();
     let msg = err.to_string();
     let lower = msg.to_lowercase();
+
+    if lower.contains("connection is closed") {
+        return AppError::new("REDIS_TLS", msg);
+    }
 
     let code = match kind {
         redis::ErrorKind::AuthenticationFailed => "REDIS_AUTH",

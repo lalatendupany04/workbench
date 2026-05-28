@@ -124,7 +124,9 @@ export function useMetrics() {
   return useQuery({
     queryKey: queryKeys.metrics,
     queryFn: ({ signal }) => api.getMetrics(signal),
-    refetchInterval: 30000, // Refresh every 30 seconds (metrics are compute-heavy)
+    staleTime: 30_000,
+    refetchInterval: 60_000, // Refresh every 60 seconds (metrics are compute-heavy)
+    refetchOnWindowFocus: false,
   });
 }
 
@@ -484,7 +486,9 @@ export function useFlows() {
   return useQuery({
     queryKey: queryKeys.flows,
     queryFn: ({ signal }) => api.getFlows(undefined, signal),
-    refetchInterval: 5000,
+    staleTime: 10_000,
+    refetchInterval: 15_000,
+    refetchOnWindowFocus: false,
   });
 }
 
@@ -497,7 +501,9 @@ export function useFlow(queueName: string, jobId: string) {
     queryFn: () => api.getFlow(queueName, jobId),
     enabled: !!queueName && !!jobId,
     retry: false, // Don't retry - flow might not exist
-    refetchInterval: 5000,
+    staleTime: 30_000,
+    refetchOnWindowFocus: false,
+    refetchInterval: false,
   });
 }
 

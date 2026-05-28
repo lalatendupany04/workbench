@@ -11,7 +11,7 @@ use tokio::time::timeout;
 
 use crate::AppError;
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(50);
 
 /// One JSON-line event emitted by the sidecar on its stdout. Mirrors
 /// `apps/desktop/sidecar/src/main.ts`. We use `untagged` so we don't have

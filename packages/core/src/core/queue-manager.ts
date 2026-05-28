@@ -1783,6 +1783,55 @@ export class QueueManager {
     return Object.keys(tags).length > 0 ? tags : undefined;
   }
 
+  private extractParentRef(job: Job): { queueName: string; id: string } | null {
+    if (job.parent?.id) {
+      const queueName = this.parseQueueNameFromQueueKey(job.parent.queueKey);
+      if (queueName) {
+        return { queueName, id: job.parent.id };
+      }
+    }
+
+    if (job.parentKey) {
+      return this.parseParentKey(job.parentKey);
+    }
+
+    return null;
+  }
+
+  private parseQueueNameFromQueueKey(queueKey?: string): string | null {
+    if (!queueKey) return null;
+    const firstColon = queueKey.indexOf(":");
+    if (firstColon === -1 || firstColon === queueKey.length - 1) {
+      return null;
+    }
+    return queueKey.slice(firstColon + 1);
+  }
+
+  private parseParentKey(parentKey: string): { queueName: string; id: string } | null {
+    // BullMQ parentKey format: "<prefix>:<queueName>:<jobId>".
+    // Both queueName and jobId can include ":", so resolve queueName by
+    // matching against known queue names (longest-first).
+    const firstColon = parentKey.indexOf(":");
+    if (firstColon === -1 || firstColon === parentKey.length - 1) {
+      return null;
+    }
+
+    const withoutPrefix = parentKey.slice(firstColon + 1);
+    const queueNames = Array.from(this.queues.keys()).sort(
+      (a, b) => b.length - a.length,
+    );
+    for (const queueName of queueNames) {
+      const prefix = `${queueName}:`;
+      if (withoutPrefix.startsWith(prefix)) {
+        const id = withoutPrefix.slice(prefix.length);
+        if (id) {
+          return { queueName, id };
+        }
+      }
+    }
+    return null;
+  }
+
   /**
    * Get unique values for a specific tag field across all jobs
    */
@@ -2148,10 +2197,16 @@ export class QueueManager {
       const queueChecks = await Promise.all(
         queueEntries.map(async ([queueName, queue]) => {
           const counts = await this.getCachedJobCounts(queue);
+          // Flow roots can finish quickly and end up only in completed/failed.
+          // Don't gate discovery to active/waiting states only.
           const hasRelevantJobs =
             (counts.waiting || 0) > 0 ||
             (counts["waiting-children"] || 0) > 0 ||
-            (counts.active || 0) > 0;
+            (counts.active || 0) > 0 ||
+            (counts.completed || 0) > 0 ||
+            (counts.failed || 0) > 0 ||
+            (counts.delayed || 0) > 0 ||
+            (counts.prioritized || 0) > 0;
           return { queueName, queue, hasRelevantJobs };
         }),
       );
@@ -2161,61 +2216,77 @@ export class QueueManager {
         return [];
       }
 
-      // Focus on waiting-children first (most likely to be flows)
-      // Then check other types with reduced limits
-      const queueResults = await Promise.all(
-        relevantQueues.map(async ({ queueName, queue }) => {
-          try {
-            // Fetch waiting-children first (most likely flows) with higher limit
-            const waitingChildrenJobs = await queue.getJobs(
-              ["waiting-children"],
-              0,
-              50,
-            );
-
-            // If we already have enough flows, skip other types
-            if (waitingChildrenJobs.length >= limit) {
-              return { queueName, jobs: waitingChildrenJobs };
-            }
-
-            // Fetch other types with reduced limits
-            const otherTypes = [
-              "active",
-              "waiting",
-              "prioritized",
-              "completed",
-              "failed",
-              "delayed",
-            ];
-            const otherJobArrays = await Promise.all(
-              otherTypes.map(async (type) => {
-                try {
-                  return await queue.getJobs(type as any, 0, 30); // Reduced from 100
-                } catch {
-                  return [];
-                }
-              }),
-            );
-
-            const allJobs = [...waitingChildrenJobs, ...otherJobArrays.flat()];
-            return { queueName, jobs: allJobs };
-          } catch {
-            return { queueName, jobs: [] };
-          }
-        }),
+      // Fast path: derive flow roots directly from BullMQ dependencies keys.
+      // This avoids expensive broad job scans on high-throughput installations.
+      const dependencyRootRefs = await this.getFlowRootRefsFromDependencies(
+        limit * 100,
       );
-
-      // Collect potential root jobs (no parent)
-      // Early exit when we have enough flows
-      const seenJobIds = new Set<string>();
-      const potentialRoots: { queueName: string; job: Job }[] = [];
-
-      for (const { queueName, jobs } of queueResults) {
-        // Early exit if we have enough flows
-        if (potentialRoots.length >= limit * 2) {
-          break;
+      if (dependencyRootRefs.length > 0) {
+        const dependencyCandidates: { queueName: string; job: Job }[] = [];
+        for (const { queueName, id } of dependencyRootRefs) {
+          const queue = this.queues.get(queueName);
+          if (!queue) continue;
+          try {
+            const job = await queue.getJob(id);
+            if (job?.id) dependencyCandidates.push({ queueName, job });
+          } catch {
+            // Root may have been removed.
+          }
         }
 
+        if (dependencyCandidates.length > 0) {
+          return this.summarizeFlowRoots(dependencyCandidates, limit);
+        }
+      }
+
+      // Focus on waiting-children first (most likely to be flows), then include
+      // other states. Use bounded concurrency to avoid connection churn on
+      // large Redis clusters.
+      const fetchQueueJobs = async (queueName: string, queue: Queue) => {
+        try {
+          // Keep scan narrow: these statuses carry enough signal for flow
+          // discovery while staying fast on large queue fleets.
+          const scanPlan: Array<{ type: JobStatus; limit: number }> = [
+            { type: "waiting-children", limit: 100 },
+            { type: "waiting", limit: 100 },
+            { type: "completed", limit: 100 },
+            { type: "failed", limit: 100 },
+            { type: "active", limit: 30 },
+          ];
+          const jobArrays = await Promise.all(
+            scanPlan.map(async ({ type, limit: perTypeLimit }) => {
+              try {
+                return await queue.getJobs(type as any, 0, perTypeLimit);
+              } catch {
+                return [];
+              }
+            }),
+          );
+
+          return { queueName, jobs: jobArrays.flat() };
+        } catch {
+          return { queueName, jobs: [] as Job[] };
+        }
+      };
+
+      const queueResults: { queueName: string; jobs: Job[] }[] = [];
+      const queueBatchSize = 5;
+      for (let i = 0; i < relevantQueues.length; i += queueBatchSize) {
+        const batch = relevantQueues.slice(i, i + queueBatchSize);
+        const batchResults = await Promise.all(
+          batch.map(({ queueName, queue }) => fetchQueueJobs(queueName, queue)),
+        );
+        queueResults.push(...batchResults);
+      }
+
+      // Build root candidates. Prefer deriving roots from child jobs' parent
+      // pointers (much faster and more reliable than brute-force scanning all
+      // root jobs on high-throughput queues).
+      const seenJobIds = new Set<string>();
+      const fallbackRoots: { queueName: string; job: Job }[] = [];
+      const parentRefs = new Map<string, { queueName: string; id: string }>();
+
+      for (const { queueName, jobs } of queueResults) {
         for (const job of jobs) {
           if (!job?.id) continue;
 
@@ -2223,72 +2294,176 @@ export class QueueManager {
           if (seenJobIds.has(jobKey)) continue;
           seenJobIds.add(jobKey);
 
-          // Check if this is a root job (has no parent)
-          const hasParent = !!job.parent || !!job.parentKey;
-          if (!hasParent) {
-            potentialRoots.push({ queueName, job });
-
-            // Early exit if we have enough potential roots
-            if (potentialRoots.length >= limit * 2) {
-              break;
-            }
+          const parentRef = this.extractParentRef(job);
+          if (parentRef) {
+            parentRefs.set(`${parentRef.queueName}:${parentRef.id}`, parentRef);
+            continue;
           }
+
+          // Fallback path when we don't see child markers in sampled jobs.
+          fallbackRoots.push({ queueName, job });
         }
       }
 
-      // Check flows in parallel (batch to avoid overwhelming Redis)
-      const batchSize = 20;
-      const flows: FlowSummary[] = [];
+      const rootCandidates = new Map<string, { queueName: string; job: Job }>();
 
-      for (
-        let i = 0;
-        i < potentialRoots.length && flows.length < limit;
-        i += batchSize
-      ) {
-        const batch = potentialRoots.slice(i, i + batchSize);
-        const batchResults = await Promise.all(
-          batch.map(async ({ queueName, job }) => {
-            try {
-              const flowTree = await this.flowProducer!.getFlow({
-                id: job.id!,
-                queueName,
-              });
-
-              if (flowTree?.children && flowTree.children.length > 0) {
-                const stats = this.countFlowStats(flowTree);
-                const state = await job.getState();
-
-                return {
-                  id: job.id!,
-                  name: job.name,
-                  queueName,
-                  status: state as JobStatus,
-                  totalJobs: stats.total,
-                  completedJobs: stats.completed,
-                  failedJobs: stats.failed,
-                  timestamp: job.timestamp,
-                  duration:
-                    job.finishedOn && job.processedOn
-                      ? job.finishedOn - job.processedOn
-                      : undefined,
-                } as FlowSummary;
-              }
-            } catch {
-              // Job might not have a flow, skip
-            }
-            return null;
-          }),
-        );
-
-        for (const result of batchResults) {
-          if (result && flows.length < limit) {
-            flows.push(result);
+      // Fast path: resolve parent refs gathered from child jobs.
+      for (const { queueName, id } of parentRefs.values()) {
+        const parentQueue = this.queues.get(queueName);
+        if (!parentQueue) continue;
+        try {
+          const parentJob = await parentQueue.getJob(id);
+          if (parentJob?.id) {
+            rootCandidates.set(`${queueName}:${parentJob.id}`, {
+              queueName,
+              job: parentJob,
+            });
           }
+        } catch {
+          // Parent may have been removed between reads.
         }
       }
 
-      return flows.sort((a, b) => b.timestamp - a.timestamp);
+      // If no child-derived roots were found, fall back to sampled root jobs.
+      if (rootCandidates.size === 0) {
+        for (const candidate of fallbackRoots) {
+          rootCandidates.set(`${candidate.queueName}:${candidate.job.id}`, candidate);
+        }
+      }
+
+      const potentialRoots = Array.from(rootCandidates.values());
+
+      return this.summarizeFlowRoots(potentialRoots, limit);
     });
+  }
+
+  private async summarizeFlowRoots(
+    roots: { queueName: string; job: Job }[],
+    limit: number,
+  ): Promise<FlowSummary[]> {
+    const batchSize = 20;
+    const flows: FlowSummary[] = [];
+
+    for (let i = 0; i < roots.length && flows.length < limit; i += batchSize) {
+      const batch = roots.slice(i, i + batchSize);
+      const batchResults = await Promise.all(
+        batch.map(async ({ queueName, job }) => {
+          try {
+            const flowTree = await this.flowProducer!.getFlow({
+              id: job.id!,
+              queueName,
+            });
+
+            if (flowTree?.children && flowTree.children.length > 0) {
+              const stats = this.countFlowStats(flowTree);
+              let state: JobStatus = "unknown";
+              try {
+                state = (await job.getState()) as JobStatus;
+              } catch {
+                // Keep flow visible even when state lookup is flaky on
+                // high-latency/shared Redis deployments.
+                if (job.finishedOn) {
+                  state = job.failedReason ? "failed" : "completed";
+                } else if (job.processedOn) {
+                  state = "active";
+                } else {
+                  state = "waiting";
+                }
+              }
+
+              return {
+                id: job.id!,
+                name: job.name,
+                queueName,
+                status: state as JobStatus,
+                totalJobs: stats.total,
+                completedJobs: stats.completed,
+                failedJobs: stats.failed,
+                timestamp: job.timestamp,
+                duration:
+                  job.finishedOn && job.processedOn
+                    ? job.finishedOn - job.processedOn
+                    : undefined,
+              } as FlowSummary;
+            }
+          } catch {
+            // Job might not have a flow, skip.
+          }
+          return null;
+        }),
+      );
+
+      for (const result of batchResults) {
+        if (result && flows.length < limit) {
+          flows.push(result);
+        }
+      }
+    }
+
+    return flows.sort((a, b) => b.timestamp - a.timestamp);
+  }
+
+  private async getFlowRootRefsFromDependencies(
+    maxKeys: number,
+  ): Promise<{ queueName: string; id: string }[]> {
+    const firstQueue = this.queues.values().next().value as Queue | undefined;
+    if (!firstQueue) return [];
+
+    const client = (firstQueue as any).client as
+      | { scan: (...args: unknown[]) => Promise<[string, string[]]> }
+      | undefined;
+    if (!client?.scan) return [];
+
+    const prefix = firstQueue.opts?.prefix ?? "bull";
+    const pattern = `${prefix}:*:dependencies`;
+    const queueNames = Array.from(this.queues.keys()).sort(
+      (a, b) => b.length - a.length,
+    );
+    const refs = new Map<string, { queueName: string; id: string }>();
+
+    let cursor = "0";
+    do {
+      const [next, keys] = await client.scan(
+        cursor,
+        "MATCH",
+        pattern,
+        "COUNT",
+        500,
+      );
+      cursor = next;
+
+      for (const key of keys) {
+        const ref = this.parseDependencyKey(key, prefix, queueNames);
+        if (ref) {
+          refs.set(`${ref.queueName}:${ref.id}`, ref);
+          if (refs.size >= maxKeys) {
+            return Array.from(refs.values());
+          }
+        }
+      }
+    } while (cursor !== "0");
+
+    return Array.from(refs.values());
+  }
+
+  private parseDependencyKey(
+    key: string,
+    prefix: string,
+    queueNames: string[],
+  ): { queueName: string; id: string } | null {
+    const head = `${prefix}:`;
+    const tail = ":dependencies";
+    if (!key.startsWith(head) || !key.endsWith(tail)) return null;
+
+    const middle = key.slice(head.length, key.length - tail.length);
+    for (const queueName of queueNames) {
+      const queuePrefix = `${queueName}:`;
+      if (middle.startsWith(queuePrefix)) {
+        const id = middle.slice(queuePrefix.length);
+        if (id) return { queueName, id };
+      }
+    }
+    return null;
   }
 
   /**
@@ -2309,7 +2484,19 @@ export class QueueManager {
         return null;
       }
 
-      return this.convertFlowTree(flowTree);
+      const nodes = await this.convertFlowChildren(flowTree);
+      if (nodes.length === 0) {
+        return null;
+      }
+      if (nodes.length === 1) {
+        return nodes[0] ?? null;
+      }
+
+      const [first, ...rest] = nodes;
+      return {
+        ...first!,
+        children: [...(first?.children ?? []), ...rest],
+      };
     } catch {
       return null;
     }
@@ -2353,7 +2540,11 @@ export class QueueManager {
   /**
    * Convert BullMQ flow tree to our FlowNode structure
    */
-  private async convertFlowTree(tree: any): Promise<FlowNode> {
+  private async convertFlowTree(tree: any): Promise<FlowNode | null> {
+    if (!tree?.job) {
+      return null;
+    }
+
     const job = tree.job;
     const state = await job.getState();
     const duration =
@@ -2391,8 +2582,16 @@ export class QueueManager {
     const children: FlowNode[] = [];
     if (tree.children && tree.children.length > 0) {
       for (const child of tree.children) {
-        children.push(await this.convertFlowTree(child));
+        const childNodes = await this.convertFlowChildren(child);
+        children.push(...childNodes);
       }
+    }
+
+    // Some BullMQ versions/flow shapes return children placeholders without
+    // materialized job payloads. Fallback to dependencies to resolve child jobs.
+    if (children.length === 0) {
+      const dependencyChildren = await this.buildChildrenFromDependencies(job);
+      children.push(...dependencyChildren);
     }
 
     return {
@@ -2400,6 +2599,84 @@ export class QueueManager {
       queueName: job.queueName || tree.queueName || "",
       children: children.length > 0 ? children : undefined,
     };
+  }
+
+  private async convertFlowChildren(tree: any): Promise<FlowNode[]> {
+    if (!tree) return [];
+
+    // BullMQ can include intermediary dependency nodes without an attached job.
+    // Flatten them so Flow Details still renders all concrete child jobs.
+    if (!tree.job) {
+      if (!tree.children || tree.children.length === 0) return [];
+      const flattened: FlowNode[] = [];
+      for (const child of tree.children) {
+        const nodes = await this.convertFlowChildren(child);
+        flattened.push(...nodes);
+      }
+      return flattened;
+    }
+
+    const node = await this.convertFlowTree(tree);
+    return node ? [node] : [];
+  }
+
+  private async buildChildrenFromDependencies(job: Job): Promise<FlowNode[]> {
+    let deps:
+      | {
+          processed?: Record<string, unknown>;
+          unprocessed?: string[] | Record<string, unknown>;
+          failed?: string[] | Record<string, unknown>;
+          ignored?: string[] | Record<string, unknown>;
+        }
+      | undefined;
+    try {
+      deps = await job.getDependencies();
+    } catch {
+      return [];
+    }
+
+    if (!deps) return [];
+
+    const depStatusMap = new Map<string, JobStatus>();
+    for (const key of Object.keys(deps.processed || {})) {
+      depStatusMap.set(key, "completed");
+    }
+    if (Array.isArray(deps.failed)) {
+      for (const key of deps.failed) depStatusMap.set(key, "failed");
+    } else {
+      for (const key of Object.keys(deps.failed || {})) depStatusMap.set(key, "failed");
+    }
+    if (Array.isArray(deps.unprocessed)) {
+      for (const key of deps.unprocessed) depStatusMap.set(key, "waiting");
+    } else {
+      for (const key of Object.keys(deps.unprocessed || {}))
+        depStatusMap.set(key, "waiting");
+    }
+    if (Array.isArray(deps.ignored)) {
+      for (const key of deps.ignored) depStatusMap.set(key, "unknown");
+    } else {
+      for (const key of Object.keys(deps.ignored || {}))
+        depStatusMap.set(key, "unknown");
+    }
+
+    const children: FlowNode[] = [];
+    for (const [depKey, status] of depStatusMap) {
+      const ref = this.parseParentKey(depKey);
+      if (!ref) continue;
+      const childInfo: JobInfo = {
+        id: ref.id,
+        name: ref.id,
+        data: {},
+        opts: {},
+        progress: 0,
+        attemptsMade: 0,
+        timestamp: job.timestamp ?? Date.now(),
+        status,
+      };
+      children.push({ job: childInfo, queueName: ref.queueName });
+    }
+
+    return children;
   }
 
   /**
@@ -2410,15 +2687,19 @@ export class QueueManager {
     completed: number;
     failed: number;
   } {
-    let total = 1;
+    if (!tree) {
+      return { total: 0, completed: 0, failed: 0 };
+    }
+
+    const job = tree.job;
+    let total = job ? 1 : 0;
     let completed = 0;
     let failed = 0;
 
     // Check current job status (synchronously from available data)
-    const job = tree.job;
-    if (job.finishedOn && !job.failedReason) {
+    if (job?.finishedOn && !job.failedReason) {
       completed = 1;
-    } else if (job.failedReason) {
+    } else if (job?.failedReason) {
       failed = 1;
     }
 
